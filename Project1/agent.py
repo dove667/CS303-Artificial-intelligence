@@ -2,12 +2,81 @@ import numpy as np
 import random
 import time
 from typing import List, Tuple, Set, Optional
+from numba import njit
 
-COLOR_BLACK=-1
-COLOR_WHITE=1
-COLOR_NONE=0
+
+COLOR_BLACK = -1
+COLOR_WHITE = 1
+COLOR_NONE = 0
 INFINITY = float('inf')
 random.seed(0)
+
+DIRS = np.array([
+    [-1, -1], [-1, 0], [-1, 1],
+    [ 0, -1],          [ 0, 1],
+    [ 1, -1], [ 1, 0], [ 1, 1]
+], dtype=np.int8)
+
+@njit(cache=True)
+def nb_get_possible_moves(board, color):
+    """
+    返回所有“与对手棋子相邻且为空”的点，形状 (K,2) 的 int32 数组。
+    """
+    opp = (board == -color)
+    neighbor = np.zeros_like(opp)
+    # 上下左右
+    neighbor[:-1, :] |= opp[1:, :]
+    neighbor[1:,  :] |= opp[:-1, :]
+    neighbor[:, :-1] |= opp[:, 1:]
+    neighbor[:, 1: ] |= opp[:, :-1]
+    # 对角
+    neighbor[:-1, :-1] |= opp[1:, 1:]
+    neighbor[:-1, 1: ] |= opp[1:, :-1]
+    neighbor[1:,  :-1] |= opp[:-1, 1:]
+    neighbor[1:,  1: ] |= opp[:-1, :-1]
+
+    possible = neighbor & (board == 0)
+    rows, cols = np.nonzero(possible)
+    k = rows.shape[0]
+    coords = np.empty((k, 2), dtype=np.int32)
+    coords = np.empty((k, 2), dtype=np.int32)
+    coords[:, 0] = rows
+    coords[:, 1] = cols
+    return coords
+
+@njit(cache=True)
+def nb_is_valid_move(board, row, col, color):
+    """
+    判断合法性并返回需要翻转的坐标数组 flips，形状 (M,2)。
+    无翻子则返回 (False, 空数组)。
+    """
+    n = board.shape[0]
+    if board[row, col] != 0:
+        return False, np.empty((0, 2), dtype=np.int32)
+
+    flips = np.empty((64, 2), dtype=np.int32)  
+    idx = 0
+    for kdir in range(DIRS.shape[0]):
+        dr = int(DIRS[kdir, 0]); dc = int(DIRS[kdir, 1])
+        r = row + dr; c = col + dc
+        # 第一格必须是对手棋子
+        if r < 0 or r >= n or c < 0 or c >= n or board[r, c] != -color:
+            continue
+        cnt = 0
+        while 0 <= r < n and 0 <= c < n and board[r, c] == -color:
+            cnt += 1
+            r += dr; c += dc
+        if cnt > 0 and 0 <= r < n and 0 <= c < n and board[r, c] == color:
+            # 回填需要翻转的格子
+            for t in range(1, cnt + 1):
+                rr = row + dr * t
+                cc = col + dc * t
+                flips[idx, 0] = rr
+                flips[idx, 1] = cc
+                idx += 1
+    if idx == 0:
+        return False, np.empty((0, 2), dtype=np.int32)
+    return True, flips[:idx]
 
 #don’t change the class name
 class AI(object):
@@ -26,46 +95,29 @@ class AI(object):
                            (0, -1),          (0, 1),
                            (1, -1),  (1, 0), (1, 1)]
         self.max_depth = 6
-    # The input is the current chessboard. Chessboard is a numpy array.
-    def _is_valid_move(self, chessboard, row, col, color) -> Tuple[bool, Optional[List[Tuple[int, int]]]]:
+        self.weighted_board = np.array([
+            [1, 8, 3, 7, 7, 3, 8, 1],
+            [8, 3, 2, 5, 5, 2, 3, 8],
+            [3, 2, 6, 6, 6, 6, 2, 3],
+            [7, 5, 6, 4, 4, 6, 5, 7],
+            [7, 5, 6, 4, 4, 6, 5, 7],
+            [3, 2, 6, 6, 6, 6, 2, 3],
+            [8, 3, 2, 5, 5, 2, 3, 8],
+            [1, 8, 3, 7, 7, 3, 8, 1],
+        ], dtype=np.int16)
+
+    def _is_valid_move(self, chessboard, row, col, color):
         """
         判断一个落子是否合法，如果是合法的，返回True和需要翻转的棋子位置列表，否则返回False和None。
-        Args:
-            chessboard: 当前棋盘状态
-            row: 落子行号
-            col: 落子列号
-            color: 落子颜色
-        Returns:
-            Tuple[bool, Optional[List[Tuple[int, int]]]]: 是否合法及需要翻转的棋子位置列表
         """
-        if chessboard[row, col] != COLOR_NONE:
-            return False, None
-   
-        flips_all = []
-        for dr, dc in self.directions:
-            r, c = row + dr, col + dc
-            line = []
-            while 0 <= r < self.chessboard_size and 0 <= c < self.chessboard_size and chessboard[r, c] == -color:
-                line.append((r, c))
-                r += dr
-                c += dc
-            if 0 <= r < self.chessboard_size and 0 <= c < self.chessboard_size and chessboard[r, c] == color and line:
-                flips_all.extend(line)
+        return nb_is_valid_move(chessboard, int(row), int(col), int(color))
 
-        if flips_all:
-            return True, flips_all
-        return False, None
-
-    def _get_possible_moves(self, chessboard, color) -> Set[Tuple[int, int]]:
-        occupied = np.where(chessboard == -color) # 返回(array of row indices, array of col indices)
-        possible_moves = set() 
-        for pos in zip(occupied[0], occupied[1]):
-            for dr, dc in self.directions:
-                new_row, new_col = pos[0] + dr, pos[1] + dc
-                if 0 <= new_row < self.chessboard_size and 0 <= new_col < self.chessboard_size and chessboard[new_row, new_col] == COLOR_NONE:
-                    possible_moves.add((new_row, new_col))
-        return possible_moves
-
+    def _get_possible_moves(self, chessboard, color):
+        """
+        返回形状 (K,2) 的 ndarray，更适合数值计算；遍历可直接 for r,c in arr
+        """
+        return nb_get_possible_moves(chessboard, int(color))
+    
     def get_candidate_reversed_list(self, chessboard, color) -> Tuple[List[Tuple[int, int]], List[List[Tuple[int, int]]]]:
         """
         获取所有合法落子点列表和对应的翻转棋子位置列表
@@ -73,21 +125,26 @@ class AI(object):
         possible_moves = self._get_possible_moves(chessboard, color)
         candidate_list = []
         reversed_list = []
-        for pos in possible_moves:
-            is_valid, reversed_opponent = self._is_valid_move(chessboard, pos[0], pos[1], color)
-            if is_valid and reversed_opponent:
-                candidate_list.append(pos)
-                reversed_list.append(reversed_opponent)
+        for r, c in possible_moves:
+            ok, flips = self._is_valid_move(chessboard, r, c, color)  # flips: (M,2) ndarray
+            if ok and flips.shape[0] > 0:
+                candidate_list.append((int(r), int(c)))
+                reversed_list.append(flips)
         return candidate_list, reversed_list
     
     def is_terminal(self, chessboard) -> bool:
         """双方都无合法步则终局"""
-        cand_b, _ = self.get_candidate_reversed_list(chessboard, COLOR_BLACK)
-        if cand_b:
-            return False
-        cand_w, _ = self.get_candidate_reversed_list(chessboard, COLOR_WHITE)
-        return len(cand_w) == 0
-        
+        return (not self._has_any_valid_move(chessboard, COLOR_BLACK)
+                and not self._has_any_valid_move(chessboard, COLOR_WHITE))
+    
+    def _has_any_valid_move(self, chessboard, color) -> bool:
+        """只要发现一个合法步就返回 True，减少不必要计算"""
+        for r, c in self._get_possible_moves(chessboard, color):
+            ok, flips = self._is_valid_move(chessboard, r, c, color)
+            if ok and flips.shape[0] > 0:
+                return True
+        return False
+    
     def _get_stable_disk(self, chessboard) -> int:
         """
         计算颜色的稳定子得分
@@ -138,19 +195,9 @@ class AI(object):
         - 不再使用“上一手翻子数”等与当前局面不稳定、符号易错的特征。
         - 对于反黑白棋，保持“白正黑负”的视角，并在极大极小中令黑方max、白方min，可自洽。
         """
-        weighted_board = np.array([
-            [1, 8, 3, 7, 7, 3, 8, 1],
-            [8, 3, 2, 5, 5, 2, 3, 8],
-            [3, 2, 6, 6, 6, 6, 2, 3],
-            [7, 5, 6, 4, 4, 6, 5, 7],
-            [7, 5, 6, 4, 4, 6, 5, 7],
-            [3, 2, 6, 6, 6, 6, 2, 3],
-            [8, 3, 2, 5, 5, 2, 3, 8],
-            [1, 8, 3, 7, 7, 3, 8, 1],
-        ])
         # 位置权重（白正黑负）
-        weighted_chessboard = float(np.sum(weighted_board * chessboard))
-    
+        weighted_chessboard = float(np.sum(self.weighted_board * chessboard))
+
         # 稳定子估计（白正黑负）
         stable_score = float(self._get_stable_disk(chessboard))
 
@@ -184,19 +231,23 @@ class AI(object):
 
             best, move = -INFINITY, None
             for candidate, reversed_opponent in zip(candidate_list, reversed_list):
-                # 执行落子
-                chessboard[candidate[0], candidate[1]] = COLOR_BLACK
-                for r, c in reversed_opponent:
-                    chessboard[r, c] = COLOR_BLACK
+                r0, c0 = candidate
+                # 执行落子（向量化翻子）
+                chessboard[r0, c0] = COLOR_BLACK
+                k = reversed_opponent.shape[0]
+                if k:
+                    rr = reversed_opponent[:, 0]
+                    cc = reversed_opponent[:, 1]
+                    chessboard[rr, cc] = COLOR_BLACK
 
                 v2, _ = min_value(chessboard, depth + 1, alpha, beta, piece_count + 1)
                 if v2 > best:
                     best, move = v2, candidate
 
-                # 回退
-                for r, c in reversed_opponent:
-                    chessboard[r, c] = COLOR_WHITE
-                chessboard[candidate[0], candidate[1]] = COLOR_NONE
+                # 回退（向量化回退）
+                if k:
+                    chessboard[rr, cc] = COLOR_WHITE
+                chessboard[r0, c0] = COLOR_NONE
 
                 # alpha-beta
                 if best > alpha:
@@ -215,19 +266,23 @@ class AI(object):
 
             best, move = INFINITY, None
             for candidate, reversed_opponent in zip(candidate_list, reversed_list):
-                # 执行落子
-                chessboard[candidate[0], candidate[1]] = COLOR_WHITE
-                for r, c in reversed_opponent:
-                    chessboard[r, c] = COLOR_WHITE
+                r0, c0 = candidate
+                # 执行落子（向量化翻子）
+                chessboard[r0, c0] = COLOR_WHITE
+                k = reversed_opponent.shape[0]
+                if k:
+                    rr = reversed_opponent[:, 0]
+                    cc = reversed_opponent[:, 1]
+                    chessboard[rr, cc] = COLOR_WHITE
 
                 v2, _ = max_value(chessboard, depth + 1, alpha, beta, piece_count + 1)
                 if v2 < best:
                     best, move = v2, candidate
 
-                # 回退
-                for r, c in reversed_opponent:
-                    chessboard[r, c] = COLOR_BLACK
-                chessboard[candidate[0], candidate[1]] = COLOR_NONE
+                # 回退（向量化回退）
+                if k:
+                    chessboard[rr, cc] = COLOR_BLACK
+                chessboard[r0, c0] = COLOR_NONE
 
                 # alpha-beta
                 if best < beta:
