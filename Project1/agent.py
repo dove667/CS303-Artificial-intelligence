@@ -34,6 +34,18 @@ HURISTIC_WEIGHTS = {
     'end': (1, 1, 7, 1)
 }
 
+# 损失权重板，正代表收益，负代表损失
+RWEIGHT_BOARD = np.array([
+            [-8, 0,  -4, -1, -1, -4, 0,  -8],
+            [0,  -2, -4, -2, -2, -4, -2, 0],
+            [-4, -4, -2, -2, -2, -2, -4, -4],
+            [-1, -2, -2, 0,  0,  -2, -2, -1],
+            [-1, -2, -2, 0,  0,  -2, -2, -1],
+            [-4, -4, -2, -2, -2, -2, -4, -4],
+            [0,  -2, -4, -2, -2, -4, -2, 0],
+            [-8, 0,  -4, -1, -1, -4, 0,  -8],
+        ], dtype=np.int16)
+
 @njit(cache=True)
 def nb_get_possible_moves(board, color):
     """
@@ -209,16 +221,6 @@ class AI(object):
                            (0, -1),          (0, 1),
                            (1, -1),  (1, 0), (1, 1)]
         self.max_depth = 64
-        self.weighted_board = np.array([
-            [20, -10,  3,   1,   1,   3,   -10,  20],
-            [-10, 5,   3,   2,   2,   3,   5,   -10],
-            [3,   3,   -5,  -2,  -2,  -5,  5,   3],
-            [10,  2,   -2,  -1,  -1,  -2,  2,   10],
-            [10,  2,   -2,  -1,  -1,  -2,  2,   10],
-            [3,   5,   -5,  -2,  -2,  -5,  5,   3],
-            [-10, 5,   3,   2,   2,   3,   5,   -10],
-            [20,  -10,  3,  10,  10,  3,   -10, 20],
-        ], dtype=np.int16)
         # 用于各层走法排序的主变线提示：pv_moves[ply] = 该层推荐走法(根为0层)
         self.pv_moves: List[Optional[Tuple[int,int]]] = [None] * (self.max_depth)
 
@@ -254,7 +256,7 @@ class AI(object):
         # 也预热稳定子评估
         _ = nb_get_stable_disk(b)
 
-    def get_candidate_reversed_list(self, chessboard, color, avoid_corners: bool = False) -> Tuple[List[Tuple[int, int]], List[np.ndarray]]:
+    def get_candidate_reversed_list(self, chessboard, color) -> Tuple[List[Tuple[int, int]], List[np.ndarray]]:
         """
         获取所有合法落子点列表和对应的翻转棋子位置列表。
         不过滤角落；排序交由搜索阶段处理（角落放到优先级最低）。
@@ -266,62 +268,55 @@ class AI(object):
         reversed_list: List[np.ndarray] = [flips_buf[offsets[i]:offsets[i+1], :] for i in range(k)]
         return candidate_list, reversed_list
         
-    def evaluate(self, chessboard, isterminal) -> float:
+    def evaluate(self, chessboard, isterminal, me_color) -> float:
         """
-        反黑白棋启发式评估。
-
-        开局: 稳定子 > 棋盘权重 > 行动力
-        中局: 行动力 > 稳定子 > 棋盘权重
-        尾局: 棋子数量 (Parity) > 稳定子
+        相对评估：返回对 me_color 有利为正，不利为负。
+        反黑白棋：自己棋子越少越好（终局时自己子更少 => +INF）。
         """
-        # 棋盘权重
-        weighted_chessboard = float(np.sum(self.weighted_board * chessboard))
+        # 从我方视角的棋盘（我方子为 +1，对手为 -1）
+        board_rel = chessboard.astype(np.int16) * np.int16(me_color)
 
-        # 行动力
-        white_cnt = nb_count_legal_moves(chessboard, COLOR_WHITE)
-        black_cnt = nb_count_legal_moves(chessboard, COLOR_BLACK)
-        mobility = float(white_cnt - black_cnt)
+        # 位置权重损失（负数）
+        weighted_rel = float(np.sum(RWEIGHT_BOARD * board_rel))
 
-        # 稳定子
-        stable_score = nb_get_stable_disk(chessboard)
-        
-        # 棋子数量差
-        piece_score = int(np.sum(chessboard))  
+        # 行动力（对方可走步数 - 我方可走步数）
+        mobility_me = nb_count_legal_moves(chessboard, me_color)
+        mobility_opp = nb_count_legal_moves(chessboard, -me_color)
+        mobility_rel = float(mobility_opp - mobility_me)
 
-        if (isterminal):
-            if piece_score > 0:
-                return INFINITY  # 白多
-            elif piece_score < 0:
-                return -INFINITY # 黑多
+        # 稳定子（白-黑），转为相对视角后“我方越多越差”-> 取负
+        stable_abs = nb_get_stable_disk(chessboard)
+        stable_rel = float(stable_abs * me_color)
+
+        # 棋子数量差（白-黑），转为相对视角后“我方越多越差”-> 取负
+        piece_abs = int(np.sum(chessboard))
+        piece_rel = float(piece_abs * me_color)
+
+        if isterminal:
+            if piece_rel < 0:
+                return INFINITY      # 我方子更少，极好
+            elif piece_rel > 0:
+                return -INFINITY     # 我方子更多，极差
             else:
-                return 0          # 平局
-            
+                return 0.0           # 平局
+
         # 动态权重
         piece_count = int(np.sum(chessboard != COLOR_NONE))
         if piece_count <= 20:
             w1, w2, w3, w4 = HURISTIC_WEIGHTS['begin']
-        elif piece_count <= 45:
+        elif piece_count <= 40:
             w1, w2, w3, w4 = HURISTIC_WEIGHTS['middle']
         else:
             w1, w2, w3, w4 = HURISTIC_WEIGHTS['end']
 
-        score = w1 * weighted_chessboard + w2 * stable_score + w3 * piece_score + w4 * mobility
+        # 反黑白棋：与己方子数正相关的项取负；行动力按相对差保留为正向
+        score = (w1 * weighted_rel) + (-w2 * stable_rel) + (-w3 * piece_rel) + (w4 * mobility_rel)
         return score
 
     def minimax_search(self, chessboard, depth_limit, deadline) -> Tuple[float, Tuple[int, int], bool, List[Tuple[int,int]]]:
         """
-        黑棋（-1）为max节点，白棋（+1）为min节点。
-        评估函数以“白方优势”为正数，故该极大极小方向在反黑白棋下自洽。
-        Args:
-            chessboard: 当前棋盘状态
-            candidate_list: 当前可选的落子点列表
-        Returns:
-            best_score: 最佳走法对应的评估值
-            best_move: 最佳走法
-            timed_out: 是否因超时而中断
-            pv: 主变线走法列表
-        备注：
-            deadline: 本次搜索的截止时间点（time.time()）
+        相对评估 + 两函数结构：轮到谁走，谁就最大化自己的效用。
+        返回: (best_score, best_move, timed_out, pv)
         """
         def time_exceeded() -> bool:
             return time.time() > deadline
@@ -339,119 +334,121 @@ class AI(object):
             except ValueError:
                 pass
 
-        def max_value(chessboard, depth, alpha, beta) -> Tuple[float, Optional[Tuple[int, int]], bool, List[Tuple[int,int]]]:
+        def max_value(board, depth, alpha, beta, curr_color) -> Tuple[float, Optional[Tuple[int, int]], bool, List[Tuple[int,int]]]:
             if time_exceeded():
-                return self.evaluate(chessboard, False), None, True, []
+                return self.evaluate(board, False, curr_color), None, True, []
             if depth == depth_limit:
-                return self.evaluate(chessboard, False), None, False, []
+                return self.evaluate(board, False, curr_color), None, False, []
 
-            candidate_list, reversed_list = self.get_candidate_reversed_list(chessboard, COLOR_BLACK)
+            candidate_list, reversed_list = self.get_candidate_reversed_list(board, curr_color)
             reorder_with_previous(candidate_list, reversed_list, depth)
-            # 启发式排序（保留 PV 在首位），其余按 |flips| 降序，再按权重降序
+            # 启发式排序（保留 PV 在首位），其余按 |flips| 升序，再按权重降序
             if len(candidate_list) > 1:
                 pairs = [(candidate_list[i], reversed_list[i]) for i in range(1, len(candidate_list))]
-                pairs.sort(key=lambda x: (x[1].shape[0], int(self.weighted_board[x[0][0], x[0][1]])), reverse=True)
+                pairs.sort(key=lambda x: (x[1].shape[0], -int(RWEIGHT_BOARD[x[0][0], x[0][1]])))
                 candidate_list = [candidate_list[0]] + [p[0] for p in pairs]
                 reversed_list  = [reversed_list[0]]  + [p[1] for p in pairs]
-            if not candidate_list:  # 无合法步，检查是否终局，否则跳过回合
-                opp_cands, _ = self.get_candidate_reversed_list(chessboard, COLOR_WHITE)
+
+            # 无子可走：若对手也无子可走，终局；否则跳过一手（视角切换并取负值）
+            if not candidate_list:
+                opp_cands, _ = self.get_candidate_reversed_list(board, -curr_color)
                 if not opp_cands:
-                    return self.evaluate(chessboard, True), None, False, []
-                return min_value(chessboard, depth + 1, alpha, beta)
+                    return self.evaluate(board, True, curr_color), None, False, []
+                v_child, _, timed_out, child_pv = min_value(board, depth + 1, -beta, -alpha, -curr_color)
+                return -v_child, None, timed_out, child_pv
 
             best, move = -INFINITY, None
             best_pv: List[Tuple[int,int]] = []
+            a = alpha
             for candidate, reversed_opponents in zip(candidate_list, reversed_list):
-                # 额外的频繁超时检查
                 if time_exceeded():
-                    # 若已有部分结果，直接返回当前最好解，以便迭代加深能利用
-                    return (best if move is not None else self.evaluate(chessboard, False)), move, True, best_pv
+                    return (best if move is not None else self.evaluate(board, False, curr_color)), move, True, best_pv
 
                 r0, c0 = candidate
-                # 执行落子
-                chessboard[r0, c0] = COLOR_BLACK
+                # 落子
+                board[r0, c0] = curr_color
                 k = reversed_opponents.shape[0]
                 if k:
-                    nb_flip_inplace(chessboard, reversed_opponents, COLOR_BLACK)
+                    nb_flip_inplace(board, reversed_opponents, curr_color)
 
-                v2, _, timed_out, child_pv = min_value(chessboard, depth + 1, alpha, beta)
-                
+                v_child, _, timed_out, child_pv = min_value(board, depth + 1, -beta, -a, -curr_color)
+
                 # 回退
                 if k:
-                    nb_flip_inplace(chessboard, reversed_opponents, COLOR_WHITE)
-                chessboard[r0, c0] = COLOR_NONE
+                    nb_flip_inplace(board, reversed_opponents, -curr_color)
+                board[r0, c0] = COLOR_NONE
 
                 if timed_out:
-                    # 子节点已超时，直接把当前最好结果向上返回
-                    return (best if move is not None else self.evaluate(chessboard, False)), move, True, best_pv
+                    return (best if move is not None else self.evaluate(board, False, curr_color)), move, True, best_pv
 
-                if v2 > best:
-                    best, move = v2, candidate
+                v = -v_child  # 转回当前走子方的相对效用
+                if v > best:
+                    best, move = v, candidate
                     best_pv = [candidate] + child_pv
-                # alpha-beta
-                if best > alpha:
-                    alpha = best
-                if alpha >= beta:
+
+                if best > a:
+                    a = best
+                if a >= beta:
                     break
             return best, move, False, best_pv
 
-        def min_value(chessboard, depth, alpha, beta) -> Tuple[float, Optional[Tuple[int, int]], bool, List[Tuple[int,int]]]:
+        def min_value(board, depth, alpha, beta, curr_color) -> Tuple[float, Optional[Tuple[int, int]], bool, List[Tuple[int,int]]]:
+            # 注：函数名保留，但语义同上——当前走子方最大化自身相对效用
             if time_exceeded():
-                return self.evaluate(chessboard, False), None, True, []
+                return self.evaluate(board, False, curr_color), None, True, []
             if depth == depth_limit:
-                return self.evaluate(chessboard, False), None, False, []
+                return self.evaluate(board, False, curr_color), None, False, []
 
-            candidate_list, reversed_list = self.get_candidate_reversed_list(chessboard, COLOR_WHITE)
+            candidate_list, reversed_list = self.get_candidate_reversed_list(board, curr_color)
             reorder_with_previous(candidate_list, reversed_list, depth)
-            # 启发式排序（保留 PV 在首位），其余按 |flips| 降序，再按权重降序
             if len(candidate_list) > 1:
                 pairs = [(candidate_list[i], reversed_list[i]) for i in range(1, len(candidate_list))]
-                pairs.sort(key=lambda x: (x[1].shape[0], int(self.weighted_board[x[0][0], x[0][1]])), reverse=True)
+                pairs.sort(key=lambda x: (x[1].shape[0], -int(RWEIGHT_BOARD[x[0][0], x[0][1]])))
                 candidate_list = [candidate_list[0]] + [p[0] for p in pairs]
                 reversed_list  = [reversed_list[0]]  + [p[1] for p in pairs]
-            if not candidate_list:  # 无合法步，检查是否终局，否则跳过回合
-                opp_cands, _ = self.get_candidate_reversed_list(chessboard, COLOR_BLACK)
-                if not opp_cands:
-                    return self.evaluate(chessboard, True), None, False, []
-                return max_value(chessboard, depth + 1, alpha, beta)
 
-            best, move = INFINITY, None
+            if not candidate_list:
+                opp_cands, _ = self.get_candidate_reversed_list(board, -curr_color)
+                if not opp_cands:
+                    return self.evaluate(board, True, curr_color), None, False, []
+                v_child, _, timed_out, child_pv = max_value(board, depth + 1, -beta, -alpha, -curr_color)
+                return -v_child, None, timed_out, child_pv
+
+            best, move = -INFINITY, None
             best_pv: List[Tuple[int,int]] = []
+            a = alpha
             for candidate, reversed_opponents in zip(candidate_list, reversed_list):
                 if time_exceeded():
-                    return (best if move is not None else self.evaluate(chessboard, False)), move, True, best_pv
+                    return (best if move is not None else self.evaluate(board, False, curr_color)), move, True, best_pv
 
                 r0, c0 = candidate
-                # 执行落子
-                chessboard[r0, c0] = COLOR_WHITE
+                board[r0, c0] = curr_color
                 k = reversed_opponents.shape[0]
                 if k:
-                    nb_flip_inplace(chessboard, reversed_opponents, COLOR_WHITE)
+                    nb_flip_inplace(board, reversed_opponents, curr_color)
 
-                v2, _, time_out, child_pv = max_value(chessboard, depth + 1, alpha, beta)
+                v_child, _, timed_out, child_pv = max_value(board, depth + 1, -beta, -a, -curr_color)
 
-                # 回退
                 if k:
-                    nb_flip_inplace(chessboard, reversed_opponents, COLOR_BLACK)
-                chessboard[r0, c0] = COLOR_NONE
+                    nb_flip_inplace(board, reversed_opponents, -curr_color)
+                board[r0, c0] = COLOR_NONE
 
-                if time_out:
-                    return (best if move is not None else self.evaluate(chessboard, False)), move, True, best_pv
+                if timed_out:
+                    return (best if move is not None else self.evaluate(board, False, curr_color)), move, True, best_pv
 
-                if v2 < best:
-                    best, move = v2, candidate
+                v = -v_child
+                if v > best:
+                    best, move = v, candidate
                     best_pv = [candidate] + child_pv
-                # alpha-beta
-                if best < beta:
-                    beta = best
-                if alpha >= beta:
+
+                if best > a:
+                    a = best
+                if a >= beta:
                     break
             return best, move, False, best_pv
 
-        if self.color == COLOR_BLACK:
-            return max_value(chessboard, 0, -INFINITY, INFINITY) # 黑棋希望评估值越大越好
-        else:
-            return min_value(chessboard, 0, -INFINITY, INFINITY) # 白棋希望评估值越小越好
+        # 根节点从我方颜色开始
+        return max_value(chessboard, 0, -INFINITY, INFINITY, self.color)
 
     def iterative_deepening(self, chessboard, start_time) -> Optional[Tuple[int,int]]:
         """
