@@ -2,6 +2,11 @@ import numpy as np
 import time
 from typing import List, Tuple, Optional
 from numba import njit
+from pathlib import Path
+try:
+    import tomli
+except ImportError:
+    tomli = None
 
 
 COLOR_BLACK = -1
@@ -46,7 +51,7 @@ RWEIGHT_BOARD = np.array([
             [-8, 0,  -4, -1, -1, -4, 0,  -8],
         ], dtype=np.int16)
 
-@njit(cache=True)
+@njit()
 def nb_get_possible_moves(board, color):
     """
     返回所有“与对手棋子相邻且为空”的点，形状 (K,2) 的数组。
@@ -72,7 +77,7 @@ def nb_get_possible_moves(board, color):
     coords[:, 1] = cols
     return coords
 
-@njit(cache=True)
+@njit()
 def nb_is_valid_move(board, row, col, color):
     """
     判断合法性并返回需要翻转的坐标数组 flips，形状 (M,2)。
@@ -105,7 +110,7 @@ def nb_is_valid_move(board, row, col, color):
         return False, np.empty((0, 2), dtype=np.int16)
     return True, flips[:idx]
 
-@njit(cache=True)
+@njit()
 def nb_has_any_valid_move(chessboard, color) -> bool:
     """只要发现一个合法步就返回 True，减少不必要计算"""
     for r, c in nb_get_possible_moves(chessboard, color):
@@ -114,7 +119,7 @@ def nb_has_any_valid_move(chessboard, color) -> bool:
             return True
     return False
 
-@njit(cache=True)
+@njit()
 def nb_count_legal_moves(chessboard, color) -> int:
     """返回合法步数量（行动子）"""
     cnt = 0
@@ -124,7 +129,7 @@ def nb_count_legal_moves(chessboard, color) -> int:
             cnt += 1
     return cnt
 
-@njit(cache=True)
+@njit()
 def nb_flip_inplace(board, flips, color):
     """把 flips 列表对应格子设置为 color（用于做/撤销）"""
     for i in range(flips.shape[0]):
@@ -132,7 +137,7 @@ def nb_flip_inplace(board, flips, color):
         c = flips[i, 1]
         board[r, c] = color
 
-@njit(cache=True)
+@njit()
 def nb_candidates_with_flips_csr(board, color):
     """
     获取所有合法落子点及对应翻转棋子位置，采用 CSR-like 存储格式：
@@ -176,7 +181,7 @@ def nb_candidates_with_flips_csr(board, color):
             offsets[vi] = write_ptr
     return moves, flips_buf, offsets
 
-@njit(cache=True)
+@njit()
 def nb_get_stable_disk(chessboard) -> int:
     """
     从四个角出发，沿三条射线（横、纵、对角）连续同色棋子记为“稳定子”的近似估计。
@@ -204,22 +209,28 @@ def nb_get_stable_disk(chessboard) -> int:
     return s
 
 
-#don’t change the class name
+#don't change the class name
 class AI(object):
     #chessboard_size, color, time_out passed from agent
-    def __init__(self, chessboard_size, color , time_out=4.9):
+    def __init__(self, chessboard_size, color, time_out=4.9, config_path=None):
         self.chessboard_size = chessboard_size
         # You are white or black
         self.color = color
-        # the max time you should use, your algorithm’s run
+        # the max time you should use, your algorithm's run
         # time must not exceed the time limit.
         self.time_out = time_out
         # You need to add your decision to your candidate_list.
         # The system will get the end of your candidate_list as your decision.
         self.candidate_list = []
-        self.directions = [(-1, -1), (-1, 0), (-1, 1),
-                           (0, -1),          (0, 1),
-                           (1, -1),  (1, 0), (1, 1)]
+        
+        # 保存为实例属性
+        self.huristic_weights = HURISTIC_WEIGHTS.copy()
+        self.rweight_board = RWEIGHT_BOARD.copy()
+    
+        # Load custom weights from config if provided
+        if config_path is not None:
+            self.load_weights_from_config(config_path)
+
         self.max_depth = 64
         # 用于各层走法排序的主变线提示：pv_moves[ply] = 该层推荐走法(根为0层)
         self.pv_moves: List[Optional[Tuple[int,int]]] = [None] * (self.max_depth)
@@ -232,6 +243,27 @@ class AI(object):
             except Exception:
                 pass
             _NUMBA_WARMED_UP = True
+    
+    def load_weights_from_config(self, config_path):
+        if tomli is None:
+            raise ImportError("tomli package required for config loading. Install with: pip install tomli")
+        
+        config_file = Path(config_path)
+        if not config_file.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        with open(config_file, 'rb') as f:
+            config = tomli.load(f)
+        
+        # 修改实例属性
+        self.huristic_weights = {
+            'begin': tuple(config['HURISTIC_WEIGHTS']['begin']),
+            'middle': tuple(config['HURISTIC_WEIGHTS']['middle']),
+            'end': tuple(config['HURISTIC_WEIGHTS']['end'])
+        }
+        self.rweight_board = np.array([
+            config['RWEIGHT_BOARD'][f'row{i}'] for i in range(8)
+        ], dtype=np.int16)
             
     def _warmup_numba(self):
         """触发 numba 编译（在构造时，不占用走子时间）"""
@@ -277,7 +309,7 @@ class AI(object):
         board_rel = chessboard.astype(np.int16) * np.int16(me_color)
 
         # 位置权重损失（负数）
-        weighted_rel = float(np.sum(RWEIGHT_BOARD * board_rel))
+        weighted_rel = float(np.sum(self.rweight_board * board_rel))
 
         # 行动力（对方可走步数 - 我方可走步数）
         mobility_me = nb_count_legal_moves(chessboard, me_color)
@@ -303,11 +335,11 @@ class AI(object):
         # 动态权重
         piece_count = int(np.sum(chessboard != COLOR_NONE))
         if piece_count <= 20:
-            w1, w2, w3, w4 = HURISTIC_WEIGHTS['begin']
+            w1, w2, w3, w4 = self.huristic_weights['begin']
         elif piece_count <= 40:
-            w1, w2, w3, w4 = HURISTIC_WEIGHTS['middle']
+            w1, w2, w3, w4 = self.huristic_weights['middle']
         else:
-            w1, w2, w3, w4 = HURISTIC_WEIGHTS['end']
+            w1, w2, w3, w4 = self.huristic_weights['end']
 
         # 反黑白棋：与己方子数正相关的项取负；行动力按相对差保留为正向
         score = (w1 * weighted_rel) + (-w2 * stable_rel) + (-w3 * piece_rel) + (w4 * mobility_rel)
@@ -345,7 +377,7 @@ class AI(object):
             # 启发式排序（保留 PV 在首位），其余按 |flips| 升序，再按权重降序
             if len(candidate_list) > 1:
                 pairs = [(candidate_list[i], reversed_list[i]) for i in range(1, len(candidate_list))]
-                pairs.sort(key=lambda x: (x[1].shape[0], -int(RWEIGHT_BOARD[x[0][0], x[0][1]])))
+                pairs.sort(key=lambda x: (x[1].shape[0], -int(self.rweight_board[x[0][0], x[0][1]])))
                 candidate_list = [candidate_list[0]] + [p[0] for p in pairs]
                 reversed_list  = [reversed_list[0]]  + [p[1] for p in pairs]
 
@@ -403,7 +435,7 @@ class AI(object):
             reorder_with_previous(candidate_list, reversed_list, depth)
             if len(candidate_list) > 1:
                 pairs = [(candidate_list[i], reversed_list[i]) for i in range(1, len(candidate_list))]
-                pairs.sort(key=lambda x: (x[1].shape[0], -int(RWEIGHT_BOARD[x[0][0], x[0][1]])))
+                pairs.sort(key=lambda x: (x[1].shape[0], -int(self.rweight_board[x[0][0], x[0][1]])))
                 candidate_list = [candidate_list[0]] + [p[0] for p in pairs]
                 reversed_list  = [reversed_list[0]]  + [p[1] for p in pairs]
 
@@ -459,7 +491,7 @@ class AI(object):
         self.previous_moves: List[Optional[Tuple[int,int]]] = [None] * self.max_depth
         deadline = start_time + min(self.time_out, 4.9)
 
-        for depth in range(5, self.max_depth + 1):
+        for depth in range(1, self.max_depth + 1):
             # IDDFS 外层超时检查（留余量）
             if time.time() > deadline:
                 break

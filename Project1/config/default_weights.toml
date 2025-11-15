@@ -1,0 +1,26 @@
+# Default weight configuration for Reverse Othello Agent
+# This represents the baseline weights from the original agent implementation
+
+[HURISTIC_WEIGHTS]
+# Weights for early game (pieces <= 20)
+# [w1: board position, w2: stable disk, w3: piece count, w4: mobility]
+begin = [3, 5, 0, 2]
+
+# Weights for middle game (21 <= pieces <= 40)
+middle = [2, 3, 0, 5]
+
+# Weights for end game (pieces > 40)
+end = [1, 1, 7, 1]
+
+# Position weight matrix (8x8)
+# Negative values indicate positions to avoid (losing value)
+# Positive values indicate desirable positions (gaining value)
+[RWEIGHT_BOARD]
+row0 = [-8, 0, -4, -1, -1, -4, 0, -8]
+row1 = [0, -2, -4, -2, -2, -4, -2, 0]
+row2 = [-4, -4, -2, -2, -2, -2, -4, -4]
+row3 = [-1, -2, -2, 0, 0, -2, -2, -1]
+row4 = [-1, -2, -2, 0, 0, -2, -2, -1]
+row5 = [-4, -4, -2, -2, -2, -2, -4, -4]
+row6 = [0, -2, -4, -2, -2, -4, -2, 0]
+row7 = [-8, 0, -4, -1, -1, -4, 0, -8]
